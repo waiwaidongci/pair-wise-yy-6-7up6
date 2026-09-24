@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { addStone } from "./src/cleaning.js";
+import { enqueueTrial, reviewEntry, completeEntry, correctEntry, recordCleaning, correctCleaningRecord, queueView } from "./src/schedule.js";
+import { queueSectionHtml, queueClientScript } from "./src/queuePage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "ink-stick-testing.json");
@@ -34,7 +37,12 @@ const seed = {
       "status": "待试磨",
       "logs": []
     }
-  ]
+  ],
+  "stones": [
+    { "id": "STONE-01", "name": "松烟磨石·甲", "cleanings": [], "dirtySince": null, "lastGroundCode": "" }
+  ],
+  "trials": [],
+  "meta": { "nextSeq": 1 }
 };
 const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
 const stages = ["待试磨","已试磨","重点观察"];
@@ -46,7 +54,18 @@ async function loadDb() {
     await mkdir(dirname(dbPath), { recursive: true });
     await writeFile(dbPath, JSON.stringify(seed, null, 2));
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  const db = JSON.parse(await readFile(dbPath, "utf8"));
+  let changed = false;
+  if (!Array.isArray(db.stones)) { db.stones = JSON.parse(JSON.stringify(seed.stones)); changed = true; }
+  if (!Array.isArray(db.trials)) { db.trials = []; changed = true; }
+  if (!db.meta || typeof db.meta !== "object") { db.meta = {}; changed = true; }
+  const maxSeq = db.trials.reduce((n, t) => Math.max(n, Number(t.seq) || 0), 0);
+  if (!Number.isInteger(db.meta.nextSeq) || db.meta.nextSeq <= maxSeq) { db.meta.nextSeq = maxSeq + 1; changed = true; }
+  for (const stone of db.stones) {
+    if (!Array.isArray(stone.cleanings)) { stone.cleanings = []; changed = true; }
+  }
+  if (changed) await saveDb(db);
+  return db;
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
@@ -94,11 +113,21 @@ function page() {
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    .queue-wrap { grid-column:1 / -1; display:grid; gap:22px; }
+    .enqueue .row { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:10px; align-items:end; }
+    .inline-form { display:flex; gap:10px; margin-top:12px; } .inline-form input { flex:1; }
+    .qitem { border-top:1px solid var(--line); padding:10px 0; display:grid; gap:6px; }
+    .qhead { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .qactions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .clean-form,.complete-form { display:grid; gap:6px; background:#f6f8f4; border:1px solid var(--line); border-radius:6px; padding:10px; }
+    .complete-form { grid-template-columns:repeat(auto-fit,minmax(120px,1fr)); align-items:end; margin-top:6px; }
+    button.link { background:none; color:var(--accent); padding:0; font-weight:400; text-decoration:underline; }
+    .pill.warn { border-color:var(--warn); color:var(--warn); }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录、磨石清洗与换色放行</div></div><button id="reload">刷新</button></header>
   <main>
     <section>
       <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
@@ -109,6 +138,7 @@ function page() {
       <div class="toolbar"><select id="statusFilter"><option value="">全部状态</option>${stages.map(s => '<option>'+s+'</option>').join('')}</select><input id="search" placeholder="搜索编号或关键词"></div>
       <div class="panel"><h2>选择墨锭后录入试磨记录，系统会保留多次试磨结果并更新评分状态。</h2><div class="grid" id="cards"></div></div>
     </section>
+    ${queueSectionHtml()}
   </main>
   <script>
     const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
@@ -147,10 +177,11 @@ function page() {
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
       return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
+    async function load() { items = await api('/api/items'); render(); if (typeof loadQueue === 'function') await loadQueue(); }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
     actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
+    ${queueClientScript()}
     renderForms(); load();
   </script>
 </body>
@@ -166,7 +197,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建墨锭" }] };
-      
+
       db.items.unshift(item);
       await saveDb(db);
       return send(res, 201, item);
@@ -205,10 +236,51 @@ const server = http.createServer(async (req, res) => {
       await saveDb(db);
       return send(res, 201, item);
     }
+    if (req.method === "GET" && url.pathname === "/api/queue") return send(res, 200, queueView(db));
+    if (req.method === "POST" && url.pathname === "/api/queue") {
+      const entry = enqueueTrial(db, await body(req));
+      await saveDb(db);
+      return send(res, 201, entry);
+    }
+    const review = url.pathname.match(/^\/api\/queue\/([^/]+)\/review$/);
+    if (review && req.method === "POST") {
+      const entry = reviewEntry(db, review[1], await body(req));
+      await saveDb(db);
+      return send(res, 200, entry);
+    }
+    const complete = url.pathname.match(/^\/api\/queue\/([^/]+)\/complete$/);
+    if (complete && req.method === "POST") {
+      const entry = completeEntry(db, complete[1], await body(req));
+      await saveDb(db);
+      return send(res, 200, entry);
+    }
+    const qpatch = url.pathname.match(/^\/api\/queue\/([^/]+)$/);
+    if (qpatch && req.method === "PATCH") {
+      const entry = correctEntry(db, qpatch[1], await body(req));
+      await saveDb(db);
+      return send(res, 200, entry);
+    }
+    if (req.method === "POST" && url.pathname === "/api/stones") {
+      const stone = addStone(db, (await body(req)).name);
+      await saveDb(db);
+      return send(res, 201, stone);
+    }
+    const cleaning = url.pathname.match(/^\/api\/stones\/([^/]+)\/cleanings$/);
+    if (cleaning && req.method === "POST") {
+      const rec = recordCleaning(db, cleaning[1], await body(req));
+      await saveDb(db);
+      return send(res, 201, rec);
+    }
+    const cleaningPatch = url.pathname.match(/^\/api\/stones\/([^/]+)\/cleanings\/([^/]+)$/);
+    if (cleaningPatch && req.method === "PATCH") {
+      const rec = correctCleaningRecord(db, cleaningPatch[1], cleaningPatch[2], await body(req));
+      await saveDb(db);
+      return send(res, 200, rec);
+    }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error.status || 500, { error: error.message });
   }
 });
 server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));

@@ -43,5 +43,18 @@
         }
       ]
     }
-  ]
+  ],
+  "stones": [
+    {
+      "id": "STONE-01",
+      "name": "松烟磨石·甲",
+      "cleanings": [],
+      "dirtySince": null,
+      "lastGroundCode": ""
+    }
+  ],
+  "trials": [],
+  "meta": {
+    "nextSeq": 1
+  }
 }
