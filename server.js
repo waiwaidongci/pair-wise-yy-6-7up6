@@ -3,6 +3,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { stoneState, recordCleaning, correctCleaning } from "./src/cleaning.js";
+import { SOOT_LEVELS, enqueue, reviewEntry, completeEntry, correctTestPrevInk, invalidateAfter, refreshStoneQueue } from "./src/schedule.js";
+import { queuePage } from "./src/queue-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "ink-stick-testing.json");
@@ -34,7 +37,15 @@ const seed = {
       "status": "待试磨",
       "logs": []
     }
-  ]
+  ],
+  "stones": [
+    { "id": "MS-1", "name": "一号磨石" },
+    { "id": "MS-2", "name": "二号磨石" }
+  ],
+  "cleaningRecords": [],
+  "queue": [],
+  "tests": [],
+  "meta": { "event": 0 }
 };
 const fields = [["code","墨锭编号","text"],["smokeSource","烟料来源","text"],["glueRatio","胶料比例","text"],["ageYears","存放年限","number"],["storage","存放位置","text"]];
 const stages = ["待试磨","已试磨","重点观察"];
@@ -46,7 +57,13 @@ async function loadDb() {
     await mkdir(dirname(dbPath), { recursive: true });
     await writeFile(dbPath, JSON.stringify(seed, null, 2));
   }
-  return JSON.parse(await readFile(dbPath, "utf8"));
+  const db = JSON.parse(await readFile(dbPath, "utf8"));
+  db.stones ||= [{ id: "MS-1", name: "一号磨石" }, { id: "MS-2", name: "二号磨石" }];
+  db.cleaningRecords ||= [];
+  db.queue ||= [];
+  db.tests ||= [];
+  db.meta ||= { event: 0 };
+  return db;
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
@@ -98,7 +115,7 @@ function page() {
   </style>
 </head>
 <body>
-  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>墨锭试磨室</h1><div class="meta">墨锭建档、试磨记录和评分统计</div></div><div style="display:flex;gap:14px;align-items:center"><a href="/queue" style="color:#526f43;font-weight:700;text-decoration:none">试磨队列 →</a><button id="reload">刷新</button></div></header>
   <main>
     <section>
       <form id="createForm"><h2>新增墨锭</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存墨锭</button></form>
@@ -206,9 +223,60 @@ const server = http.createServer(async (req, res) => {
       return send(res, 201, item);
     }
     if (req.method === "GET" && url.pathname === "/api/stats") return send(res, 200, computeStats(db.items));
+    if (req.method === "GET" && url.pathname === "/queue") return html(res, queuePage());
+    if (req.method === "GET" && url.pathname === "/api/stones") return send(res, 200, db.stones.map(s => ({ ...s, state: stoneState(db, s.id) })));
+    if (req.method === "GET" && url.pathname === "/api/queue") return send(res, 200, [...db.queue].sort((a, b) => a.seq - b.seq));
+    if (req.method === "GET" && url.pathname === "/api/tests") return send(res, 200, [...db.tests].sort((a, b) => a.n - b.n));
+    if (req.method === "GET" && url.pathname === "/api/cleaning") return send(res, 200, [...db.cleaningRecords].sort((a, b) => b.n - a.n));
+    if (req.method === "POST" && url.pathname === "/api/queue") {
+      const input = await body(req);
+      if (!db.stones.some(s => s.id === input.stoneId)) return send(res, 400, { error: "磨石不存在" });
+      if (!db.items.some(x => x.code === input.inkCode || x.id === input.inkCode)) return send(res, 400, { error: "墨锭不存在，请先在建档页登记" });
+      if (!SOOT_LEVELS.includes(input.sootDepth)) return send(res, 400, { error: "烟料深浅须为：" + SOOT_LEVELS.join("、") });
+      if (!input.createdBy) return send(res, 400, { error: "请填写提交人" });
+      const entry = enqueue(db, input);
+      await saveDb(db);
+      return send(res, 201, entry);
+    }
+    if (req.method === "POST" && url.pathname === "/api/cleaning") {
+      const input = await body(req);
+      if (!db.stones.some(s => s.id === input.stoneId)) return send(res, 400, { error: "磨石不存在" });
+      if (!input.cleaner) return send(res, 400, { error: "请填写清洗人" });
+      if (input.turbidity === undefined || input.turbidity === "" || isNaN(Number(input.turbidity))) return send(res, 400, { error: "请填写冲洗水浊度" });
+      const record = recordCleaning(db, input);
+      refreshStoneQueue(db, input.stoneId);
+      await saveDb(db);
+      return send(res, 201, record);
+    }
+    const review = url.pathname.match(/^\/api\/queue\/([^/]+)\/review$/);
+    if (review && req.method === "POST") {
+      const entry = reviewEntry(db, review[1], await body(req));
+      await saveDb(db);
+      return send(res, 200, entry);
+    }
+    const complete = url.pathname.match(/^\/api\/queue\/([^/]+)\/complete$/);
+    if (complete && req.method === "POST") {
+      const result = completeEntry(db, complete[1], await body(req));
+      await saveDb(db);
+      return send(res, 201, result);
+    }
+    const cleanCorrect = url.pathname.match(/^\/api\/cleaning\/([^/]+)$/);
+    if (cleanCorrect && req.method === "PATCH") {
+      const record = correctCleaning(db, cleanCorrect[1], await body(req));
+      if (!record) return send(res, 404, { error: "cleaning_not_found" });
+      const invalidated = invalidateAfter(db, record.stoneId, record.n, `清洗记录更正（浊度${record.turbidity}度）`);
+      await saveDb(db);
+      return send(res, 200, { record, invalidated: invalidated.length });
+    }
+    const testCorrect = url.pathname.match(/^\/api\/tests\/([^/]+)$/);
+    if (testCorrect && req.method === "PATCH") {
+      const result = correctTestPrevInk(db, testCorrect[1], await body(req));
+      await saveDb(db);
+      return send(res, 200, result);
+    }
     send(res, 404, { error: "not_found" });
   } catch (error) {
-    send(res, 500, { error: error.message });
+    send(res, error.statusCode || 500, { error: error.message });
   }
 });
 server.listen(port, () => console.log("墨锭试磨室 listening on http://localhost:" + port));
